@@ -33,7 +33,16 @@
           }
         }
       ],
-      "expo-system-ui"
+      "expo-system-ui",
+      [
+        "expo-localization",
+        {
+          "supportedLocales": {
+            "ios": ["en", "fr"],
+            "android": ["en", "fr"]
+          }
+        }
+      ]
     ]
   }
 }
