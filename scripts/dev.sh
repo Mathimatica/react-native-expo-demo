@@ -1,103 +1,37 @@
-#!/bin/zsh
-
+#!/usr/bin/env bash
 set -e
 
-# ---------------------------------------------------------
-# react-native-expo-demo local development environment
-# ---------------------------------------------------------
+source "$(dirname "${BASH_SOURCE[0]}")/dev-common.sh"
 
-PROJECT_NAME="react-native-expo-demo"
-
-# iOS 27 - iPhone 17
-IOS_UDID="A4231244-9C26-40F2-A738-A7E915B99A1C"
-
-# Android
-ANDROID_AVD="Pixel_9a"
-ANDROID_PACKAGE="com.anonymous.reactnativeexpodemo"
-
-# Expo Development Client
-DEV_CLIENT_URL="exp+react-native-expo-demo://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081"
-
-
-# ---------------------------------------------------------
-# Node / NVM
-# ---------------------------------------------------------
-
-export NVM_DIR="$HOME/.nvm"
-
-if [ -s "$NVM_DIR/nvm.sh" ]; then
-  source "$NVM_DIR/nvm.sh"
+CURRENT_FINGERPRINT=$(native_fingerprint)
+SAVED_FINGERPRINT=""
+if [ -f "$FINGERPRINT_FILE" ]; then
+  SAVED_FINGERPRINT=$(cat "$FINGERPRINT_FILE")
 fi
 
-echo ""
-echo "▶ Using project Node version..."
-nvm use
-
-
-# ---------------------------------------------------------
-# iOS
-# ---------------------------------------------------------
-
-echo ""
-echo "▶ Starting iOS 27 / iPhone 17..."
-
-if ! xcrun simctl list devices | grep "$IOS_UDID" | grep -q "(Booted)"; then
-  xcrun simctl boot "$IOS_UDID" 2>/dev/null || true
+if [ "$CURRENT_FINGERPRINT" != "$SAVED_FINGERPRINT" ]; then
+  echo "Native configuration changed, or no successful native build is recorded."
+  echo "Rebuilding regenerates ios/ and android/ with expo prebuild --clean."
+  REBUILD=""
+  if [ -t 0 ]; then
+    read -r -p "Rebuild iOS and Android now? [y/N] " REBUILD || true
+  fi
+  case "$REBUILD" in
+    y|Y|yes|YES|Yes) exec bash "$REPO_ROOT/scripts/dev-native.sh" ;;
+    *) echo "Warning: native builds may be stale. Run npm run dev:native to rebuild." ;;
+  esac
 fi
 
-xcrun simctl bootstatus "$IOS_UDID" -b
-
-# Xcode 27 uses Device Hub
-open -a DeviceHub 2>/dev/null || true
-
-echo "✓ iPhone 17 ready"
-
-
-# ---------------------------------------------------------
-# Android
-# ---------------------------------------------------------
-
-echo ""
-echo "▶ Starting Android / Pixel 9a..."
-
-find_android_emulator() {
-  for SERIAL in $(adb devices | awk '/^emulator-/{print $1}'); do
-    AVD_NAME=$(adb -s "$SERIAL" emu avd name 2>/dev/null | head -1 | tr -d '\r')
-
-    if [ "$AVD_NAME" = "$ANDROID_AVD" ]; then
-      echo "$SERIAL"
-      return
-    fi
-  done
-}
-
-ANDROID_SERIAL=$(find_android_emulator)
-
-if [ -z "$ANDROID_SERIAL" ]; then
-  echo "  Launching $ANDROID_AVD..."
-
-  emulator -avd "$ANDROID_AVD" \
-    > "/tmp/${PROJECT_NAME}-android-emulator.log" 2>&1 &
-
-  echo "  Waiting for emulator..."
-
-  while [ -z "$ANDROID_SERIAL" ]; do
-    sleep 2
-    ANDROID_SERIAL=$(find_android_emulator)
-  done
+# All clients use this fixed port; never silently switch to another Metro port.
+if lsof -nP -iTCP:8081 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port 8081 is already in use. Stop its server before running npm run dev." >&2
+  exit 1
 fi
 
-echo "  Waiting for Android to finish booting..."
-
-while [ "$(adb -s "$ANDROID_SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
-  sleep 2
-done
-
-# Forward Android emulator port 8081 back to Metro on the Mac.
-adb -s "$ANDROID_SERIAL" reverse tcp:8081 tcp:8081
-
-echo "✓ Pixel 9a ready ($ANDROID_SERIAL)"
-
+prepare_devices
+ANDROID_PACKAGE=$(node -p 'require("./app.json").expo.android.package')
+DEV_CLIENT_SCHEME=$(node -p '"exp+" + require("./app.json").expo.slug')
+DEV_CLIENT_URL="${DEV_CLIENT_SCHEME}://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081"
 
 # ---------------------------------------------------------
 # Launch apps once Metro becomes available
@@ -108,8 +42,13 @@ launch_apps() {
   echo ""
   echo "▶ Waiting for Metro..."
 
-  until curl -fsS http://127.0.0.1:8081/status 2>/dev/null \
+  local metro_deadline=$((SECONDS + 120))
+  until curl --max-time 2 -fsS http://127.0.0.1:8081/status 2>/dev/null \
     | grep -q "packager-status:running"; do
+    if (( SECONDS >= metro_deadline )); then
+      echo "Timed out waiting for Metro on port 8081." >&2
+      return 1
+    fi
     sleep 1
   done
 
@@ -121,7 +60,7 @@ launch_apps() {
   xcrun simctl openurl \
     "$IOS_UDID" \
     "$DEV_CLIENT_URL" \
-    2>/dev/null || true
+    || { echo "Could not open the iOS development client." >&2; return 1; }
 
   echo "▶ Opening Android app..."
 
@@ -130,21 +69,19 @@ launch_apps() {
     -a android.intent.action.VIEW \
     -d "$DEV_CLIENT_URL" \
     -p "$ANDROID_PACKAGE" \
-    >/dev/null 2>&1 || true
+    || { echo "Could not open the Android development client." >&2; return 1; }
 
   echo ""
   echo "✓ iOS and Android connected"
 }
 
 launch_apps &
+LAUNCH_PID=$!
+# Do not leave the readiness watcher running if Metro fails or is interrupted.
+trap 'kill "$LAUNCH_PID" 2>/dev/null || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 
-# ---------------------------------------------------------
-# Metro
-# ---------------------------------------------------------
-
-echo ""
 echo "▶ Starting Metro..."
-echo ""
-
-npx expo start
+npx expo start --dev-client --localhost --port 8081
